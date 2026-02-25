@@ -9,11 +9,13 @@ from langchain_community.vectorstores import FAISS
 from langchain_community.retrievers import BM25Retriever
 from groq import Groq
 
+from rapidfuzz import process, fuzz
+
 
 # ---------------------------------
 # STREAMLIT TITLE
 # ---------------------------------
-st.title("🧪 LLM MnSol ΔG Solvation Assistant (Hybrid Search)")
+st.title("🧪 MnSol ΔG Solvation Assistant (Hybrid + Auto Matcher)")
 
 
 # ---------------------------------
@@ -26,7 +28,6 @@ INDEX_FOLDER = "mnsol_faiss_index"
 if not os.path.exists(INDEX_FOLDER):
 
     with st.spinner("Downloading vector database..."):
-
         url = f"https://drive.google.com/uc?id={FILE_ID}"
         gdown.download(url, ZIP_FILE, quiet=False)
 
@@ -35,9 +36,32 @@ if not os.path.exists(INDEX_FOLDER):
 
 
 # ---------------------------------
-# LOAD CSV
+# LOAD DATASET
 # ---------------------------------
 df = pd.read_csv("new_dataset_with_predictions.csv")
+
+solute_list = df["solute"].astype(str).unique().tolist()
+solvent_list = df["solvent"].astype(str).unique().tolist()
+
+
+# ---------------------------------
+# AUTO MOLECULE MATCHER
+# ---------------------------------
+def match_name(user_input, choices):
+
+    if not user_input:
+        return user_input
+
+    match, score, _ = process.extractOne(
+        user_input,
+        choices,
+        scorer=fuzz.WRatio
+    )
+
+    if score > 75:
+        return match
+
+    return user_input
 
 
 # ---------------------------------
@@ -68,13 +92,11 @@ vectorstore = load_vectorstore()
 @st.cache_resource
 def create_retrievers(vectorstore):
 
-    # Semantic search (FAISS)
     vector_retriever = vectorstore.as_retriever(
         search_type="similarity",
         search_kwargs={"k": 3}
     )
 
-    # Keyword search (BM25)
     docs = list(vectorstore.docstore._dict.values())
 
     bm25_retriever = BM25Retriever.from_documents(docs)
@@ -87,20 +109,19 @@ vector_retriever, bm25_retriever = create_retrievers(vectorstore)
 
 
 # ---------------------------------
-# HYBRID SEARCH FUNCTION ⭐
+# HYBRID SEARCH
 # ---------------------------------
 def hybrid_search(query):
 
-    semantic_results = vector_retriever.invoke(f"query: {query}")
-    keyword_results = bm25_retriever.invoke(query)
+    semantic_docs = vector_retriever.invoke(f"query: {query}")
+    keyword_docs = bm25_retriever.invoke(query)
 
-    # Remove duplicates
-    combined_docs = {
+    combined = {
         doc.page_content: doc
-        for doc in semantic_results + keyword_results
+        for doc in semantic_docs + keyword_docs
     }
 
-    return list(combined_docs.values())[:5]
+    return list(combined.values())[:5]
 
 
 # ---------------------------------
@@ -110,15 +131,40 @@ client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 
 
 # ---------------------------------
-# USER QUERY
+# USER INPUT
 # ---------------------------------
-query = st.text_input("Ask your solvation question")
+st.subheader("Enter Molecule Details")
+
+formula = st.text_input("Solute / Molecular Formula")
+charge = st.text_input("Charge")
+solvent = st.text_input("Solvent Name")
+
+search_button = st.button("Predict DeltaG")
 
 
 # ---------------------------------
 # QUERY EXECUTION
 # ---------------------------------
-if query:
+if search_button:
+
+    if not formula or not solvent:
+        st.warning("Please enter Solute and Solvent")
+        st.stop()
+
+    # Auto molecule correction
+    matched_solute = match_name(formula, solute_list)
+    matched_solvent = match_name(solvent, solvent_list)
+
+    st.info(
+        f"Matched Solute: {matched_solute} | "
+        f"Matched Solvent: {matched_solvent}"
+    )
+
+    query = f"""
+    solute: {matched_solute},
+    charge: {charge},
+    solvent: {matched_solvent}
+    """
 
     with st.spinner("Searching MnSol dataset..."):
 
@@ -137,16 +183,16 @@ if query:
 You are a dataset-driven chemistry assistant.
 
 RULES:
-- Answer ONLY using dataset context.
+- Use ONLY dataset context.
 - Do NOT use external chemistry knowledge.
-- Extract DeltaG directly from dataset.
+- Extract DeltaG exactly from dataset.
+- Match solute and solvent carefully.
 - Keep answer short.
 
 Output format:
 
 DeltaG: <value>
-
-Explanation: <short dataset-based explanation>
+Explanation: <short dataset explanation>
 """
                 },
                 {
@@ -155,8 +201,9 @@ Explanation: <short dataset-based explanation>
 Dataset Context:
 {context}
 
-User Question:
-{query}
+Solute: {matched_solute}
+Charge: {charge}
+Solvent: {matched_solvent}
 """
                 }
             ]
