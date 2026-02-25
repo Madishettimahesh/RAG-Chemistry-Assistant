@@ -2,6 +2,7 @@ streamlit
 pandas
 langchain-huggingface
 langchain-community
+rank-bm25
 sentence-transformers
 faiss-cpu
 groq
