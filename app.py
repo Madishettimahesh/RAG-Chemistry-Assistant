@@ -8,19 +8,18 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.retrievers import BM25Retriever
 from groq import Groq
-
 from rapidfuzz import process, fuzz
 
 
-# ---------------------------------
-# STREAMLIT TITLE
-# ---------------------------------
-st.title("🧪 MnSol ΔG Solvation Assistant (Hybrid + Auto Matcher)")
+# ------------------------------------------------
+# TITLE
+# ------------------------------------------------
+st.title("🧪 MnSol ΔG Solvation Assistant")
 
 
-# ---------------------------------
+# ------------------------------------------------
 # DOWNLOAD FAISS INDEX
-# ---------------------------------
+# ------------------------------------------------
 FILE_ID = "1gUKTTKNjOqI2jP3I6bGVSmFtb3JD7jn2"
 ZIP_FILE = "mnsol_faiss_index.zip"
 INDEX_FOLDER = "mnsol_faiss_index"
@@ -35,26 +34,38 @@ if not os.path.exists(INDEX_FOLDER):
             zip_ref.extractall(".")
 
 
-# ---------------------------------
+# ------------------------------------------------
 # LOAD DATASET
-# ---------------------------------
+# ------------------------------------------------
 df = pd.read_csv("new_dataset_with_predictions.csv")
 
-solute_list = df["solute"].astype(str).unique().tolist()
-solvent_list = df["solvent"].astype(str).unique().tolist()
+solute_list = df["SoluteName"].astype(str).unique().tolist()
+solvent_list = df["Solvent"].astype(str).unique().tolist()
+
+# Formula → Solute mapping
+formula_to_solute = dict(
+    zip(
+        df["Formula"].astype(str).str.lower(),
+        df["SoluteName"]
+    )
+)
 
 
-# ---------------------------------
-# AUTO MOLECULE MATCHER
-# ---------------------------------
-def match_name(user_input, choices):
+# ------------------------------------------------
+# AUTO MATCH FUNCTIONS
+# ------------------------------------------------
+def resolve_solute(user_input):
 
-    if not user_input:
-        return user_input
+    key = user_input.lower().strip()
 
+    # Formula match
+    if key in formula_to_solute:
+        return formula_to_solute[key]
+
+    # Fuzzy match
     match, score, _ = process.extractOne(
         user_input,
-        choices,
+        solute_list,
         scorer=fuzz.WRatio
     )
 
@@ -64,9 +75,46 @@ def match_name(user_input, choices):
     return user_input
 
 
-# ---------------------------------
+def match_solvent(user_input):
+
+    match, score, _ = process.extractOne(
+        user_input,
+        solvent_list,
+        scorer=fuzz.WRatio
+    )
+
+    if score > 75:
+        return match
+
+    return user_input
+
+
+# ------------------------------------------------
+# EXACT DATASET LOOKUP ⭐
+# ------------------------------------------------
+def exact_lookup(solute, solvent, charge):
+
+    result = df[
+        (df["SoluteName"].str.lower() == solute.lower()) &
+        (df["Solvent"].str.lower() == solvent.lower())
+    ]
+
+    if charge != "":
+        result = result[
+            result["Charge"].astype(str) == str(charge)
+        ]
+
+    if len(result) > 0:
+        row = result.iloc[0]
+
+        return row["Predicted_DeltaGsolv"]
+
+    return None
+
+
+# ------------------------------------------------
 # LOAD VECTOR STORE
-# ---------------------------------
+# ------------------------------------------------
 @st.cache_resource
 def load_vectorstore():
 
@@ -74,21 +122,19 @@ def load_vectorstore():
         model_name="BAAI/bge-base-en-v1.5"
     )
 
-    vectorstore = FAISS.load_local(
+    return FAISS.load_local(
         INDEX_FOLDER,
         embeddings,
         allow_dangerous_deserialization=True
     )
 
-    return vectorstore
-
 
 vectorstore = load_vectorstore()
 
 
-# ---------------------------------
-# CREATE HYBRID RETRIEVERS
-# ---------------------------------
+# ------------------------------------------------
+# HYBRID RETRIEVERS
+# ------------------------------------------------
 @st.cache_resource
 def create_retrievers(vectorstore):
 
@@ -99,115 +145,117 @@ def create_retrievers(vectorstore):
 
     docs = list(vectorstore.docstore._dict.values())
 
-    bm25_retriever = BM25Retriever.from_documents(docs)
-    bm25_retriever.k = 3
+    bm25 = BM25Retriever.from_documents(docs)
+    bm25.k = 3
 
-    return vector_retriever, bm25_retriever
+    return vector_retriever, bm25
 
 
 vector_retriever, bm25_retriever = create_retrievers(vectorstore)
 
 
-# ---------------------------------
-# HYBRID SEARCH
-# ---------------------------------
 def hybrid_search(query):
 
-    semantic_docs = vector_retriever.invoke(f"query: {query}")
-    keyword_docs = bm25_retriever.invoke(query)
+    semantic = vector_retriever.invoke(query)
+    keyword = bm25_retriever.invoke(query)
 
     combined = {
         doc.page_content: doc
-        for doc in semantic_docs + keyword_docs
+        for doc in semantic + keyword
     }
 
     return list(combined.values())[:5]
 
 
-# ---------------------------------
+# ------------------------------------------------
 # GROQ API
-# ---------------------------------
+# ------------------------------------------------
 client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 
 
-# ---------------------------------
+# ------------------------------------------------
 # USER INPUT
-# ---------------------------------
+# ------------------------------------------------
 st.subheader("Enter Molecule Details")
 
-formula = st.text_input("Solute / Molecular Formula")
+formula = st.text_input("Formula or Solute Name")
 charge = st.text_input("Charge")
-solvent = st.text_input("Solvent Name")
+solvent = st.text_input("Solvent")
 
-search_button = st.button("Predict DeltaG")
+search = st.button("Get DeltaG")
 
 
-# ---------------------------------
-# QUERY EXECUTION
-# ---------------------------------
-if search_button:
+# ------------------------------------------------
+# EXECUTION
+# ------------------------------------------------
+if search:
 
     if not formula or not solvent:
-        st.warning("Please enter Solute and Solvent")
+        st.warning("Please enter required inputs")
         st.stop()
 
-    # Auto molecule correction
-    matched_solute = match_name(formula, solute_list)
-    matched_solvent = match_name(solvent, solvent_list)
+    matched_solute = resolve_solute(formula)
+    matched_solvent = match_solvent(solvent)
 
     st.info(
         f"Matched Solute: {matched_solute} | "
         f"Matched Solvent: {matched_solvent}"
     )
 
+    # ✅ EXACT LOOKUP FIRST
+    deltag = exact_lookup(
+        matched_solute,
+        matched_solvent,
+        charge
+    )
+
+    if deltag is not None:
+
+        st.success("Exact Dataset Match Found ✅")
+
+        st.write(f"""
+### DeltaG: {deltag}
+
+Explanation: Retrieved directly from MnSol dataset.
+""")
+
+        st.stop()
+
+    # ------------------------------------------------
+    # HYBRID RAG FALLBACK
+    # ------------------------------------------------
     query = f"""
-    solute: {matched_solute},
-    charge: {charge},
-    solvent: {matched_solvent}
+    SoluteName {matched_solute}
+    Solvent {matched_solvent}
+    Charge {charge}
+    solvation free energy DeltaG
     """
 
-    with st.spinner("Searching MnSol dataset..."):
+    docs = hybrid_search(query)
 
-        docs = hybrid_search(query)
+    context = "\n\n".join(
+        [doc.page_content for doc in docs]
+    )
 
-        context = "\n\n".join(
-            [doc.page_content for doc in docs]
-        )
-
-        completion = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {
-                    "role": "system",
-                    "content": """
-You are a dataset-driven chemistry assistant.
-
-RULES:
-- Use ONLY dataset context.
-- Do NOT use external chemistry knowledge.
-- Extract DeltaG exactly from dataset.
-- Match solute and solvent carefully.
-- Keep answer short.
-
-Output format:
-
-DeltaG: <value>
-Explanation: <short dataset explanation>
+    completion = client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[
+            {
+                "role": "system",
+                "content": """
+Answer ONLY using dataset context.
+Extract DeltaG value if present.
+Keep answer short.
 """
-                },
-                {
-                    "role": "user",
-                    "content": f"""
+            },
+            {
+                "role": "user",
+                "content": f"""
 Dataset Context:
 {context}
-
-Solute: {matched_solute}
-Charge: {charge}
-Solvent: {matched_solvent}
 """
-                }
-            ]
-        )
+            }
+        ]
+    )
 
-        st.success("Result")
-        st.write(completion.choices[0].message.content)
+    st.write(completion.choices[0].message.content)
